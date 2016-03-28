@@ -22,6 +22,7 @@ Gem::Specification.new do |s|
   # Gem dependencies
   s.add_runtime_dependency "logstash-core-plugin-api", "~> 1.0"
 
+  s.add_runtime_dependency 'redis', ['>= 3.2.1']
   s.add_runtime_dependency 'geoip', ['>= 1.3.2']
   s.add_runtime_dependency 'lru_redux', "~> 1.1.0"
 
