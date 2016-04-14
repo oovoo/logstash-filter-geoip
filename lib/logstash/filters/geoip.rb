@@ -54,8 +54,27 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
   config :net_acuity_address, :validate => :string
 
   # NetAcuity can be used for fetching different type of information. You can specify it by
-  # choosing different api_id. By default - 3 (GEO API)
-  config :net_acuity_api_id, :validate => :number, :default => 3
+  # choosing different api_id. By default - [3,7,8,12]
+  # API_ID  | DB Name   | Info
+  #   3     |  GEO      | ["country", "region", "city", "conn-speed", "country-conf", "region-conf", "city-conf", "metro-code", "latitude", "longitude", "country-code", "region-code", "city-code", "continent-code", "two-letter-country"]
+  #   4     |  EDGE     | ["edge-country", "edge-region", "edge-city", "edge-conn-speed", "edge-metro-code", "edge-latitude", "edge-longitude", "edge-postal-code", "edge-country-code", "edge-region-code", "edge-city-code", "edge-continent-code", "edge-two-letter-country", "edge-internal-code", "edge-area-codes", "edge-country-conf", "edge-region-conf", "edge-city-conf", "edge-postal-code-conf", "edge-gmt-offset", "edge-in-dst"]
+  #   5     |  SIC      | ["sic-code"]
+  #   6     |  DOMAIN   | ["domain-name"]
+  #   7     |  ZIP      | ["area-code", "zip-code", "gmt-offset", "in-dst", "zip-code-text", "zip-country"]
+  #   8     |  ISP      | ["isp-name"]
+  #   9     |  HOME_BIZ | ["homebiz-type"]
+  #   10    |  ASN      | [ "asn", "asn-name"]
+  #   11    |  LANGUAGE | [ "primary-lang","secondary-lang"]
+  #   12    |  PROXY    | ["proxy-type","proxy-description"]
+  #   14    |  ISANISP  | ["is-an-isp"]
+  #   15    |  COMPANY  | ["company-name"]
+  #   17    |  DEMOGRAPHICS| ["rank", "households", "women", "w18-34", "w35-39", "men", "m18-34", "m35-49", "teens", "kids"]
+  #   18    |  NAICS    | ["naics-code"]
+  #   19    |  CBSA     | ["cbsa-code", "cbsa-title", "cbsa-type", "csa-code", "csa-title", "md-code", "md-title"]
+  #   24    |  MOBILE_CARRIER | ["mobile-carrier", "mcc", "mnc"]
+  #   25    |  ORG      | ["organization-name"]
+  #   26    |  PULSE    | ["pulse-country", "pulse-region", "pulse-city", "pulse-conn-speed", "pulse-conn-type", "pulse-metro-code", "pulse-latitude", "pulse-longitude", "pulse-postal-code", "pulse-country-code", "pulse-region-code", "pulse-city-code", "pulse-continent-code", "pulse-two-letter-country", "pulse-internal-code", "pulse-area-codes", "pulse-country-conf", "pulse-region-conf", "pulse-city-conf", "pulse-postal-conf", "pulse-gmt-offset", "pulse-in-dst"]
+  config :net_acuity_api, :validate => :array, :default => [3, 7, 8, 12]
 
   # The field containing the IP address or hostname to map via geoip. If
   # this field is an array, only the first value will be used.
@@ -98,6 +117,9 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
   # 'caching_source' will define place for caching you GEOIP information on LRU principles.
   config :caching_source, :validate => :string, :default => 'lru_cache'
 
+  # Possible fields which will be cached. Otherwise all info will be cached
+  config :caching_fields, :validate => :array
+
 
   # This MUST be set to a value > 0. There is really no reason to not want this behavior, the overhead is minimal
   # and the speed gains are large.
@@ -129,6 +151,9 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
 
   # Set Time to Live on each inserted key to Redis
   config :redis_ttl, :validate => :number, :default => 0
+
+  # Keyspace which will be used for SET keys to redis
+  config :redis_key_preffix, :validate => :string, :default => "geo"
 
   public
   def register
@@ -181,6 +206,7 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
     end
 
     @no_fields = @fields.nil? || @fields.empty?
+    @all_caching_fields = @caching_fields.nil? || @caching_fields.empty?
   end # def register
 
   public
@@ -228,7 +254,8 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
       cached
     else
       geo_data = get_geo_data_db(ip)
-      converted = prepare_geodata_for_cache(geo_data)
+      geo_data_filtered = filter_caching_fields(geo_data)
+      converted = prepare_geodata_for_cache(geo_data_filtered)
       setup_cache(ip, converted)
       converted
     end
@@ -236,7 +263,11 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
 
   def get_geo_data_db(ip)
     if @database.casecmp('netacuity').zero?
-      @netAcuityDB.query(ip, @net_acuity_api_id, 1)
+      result = Hash.new
+      @net_acuity_api.each{ |api_id|
+        result = result.merge(@netAcuityDB.query(ip, api_id, api_id))
+      }
+      result
     else
       ensure_geoip_database!
       Thread.current[threadkey].send(@geoip_type, ip)
@@ -245,7 +276,7 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
 
   def lookup_cache(ip)
     if @caching_source.casecmp('redis').zero?
-      cached = redis_cache.get(ip)
+      cached = redis_cache.get(redis_key(ip))
       cached.nil? ? false : JSON.parse(cached)
     else
       local_cache[ip]
@@ -255,11 +286,24 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
 
   def setup_cache(ip, converted)
     if @caching_source.casecmp("redis").zero?
-      redis_cache.setex(ip, @redis_ttl, converted.to_json)
+      redis_cache.setex(redis_key(ip), @redis_ttl, converted.to_json)
     else
       local_cache[ip] = converted
     end
 
+  end
+
+  def filter_caching_fields(geo_data_hash)
+    geodata_hash_filtered = {}
+
+    geo_data_hash.each do |key, value|
+      if @all_caching_fields || @caching_fields.include?(key)
+        # can't dup numerics
+        geodata_hash_filtered["#{key}"] = value.is_a?(Numeric) ? value : value.dup
+      end
+    end # geo_data_hash.each
+
+    geodata_hash_filtered
   end
 
 
@@ -294,6 +338,10 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
     end
 
     result
+  end
+
+  def redis_key(key)
+    "#{@redis_key_preffix}:#{key}"
   end
 
   def ensure_geoip_database!
