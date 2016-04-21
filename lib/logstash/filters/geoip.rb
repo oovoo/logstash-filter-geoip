@@ -265,7 +265,8 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
     if @database.casecmp('netacuity').zero?
       result = Hash.new
       @net_acuity_api.each{ |api_id|
-        result = result.merge(@netAcuityDB.query(ip, api_id, api_id))
+        na_res = @netAcuityDB.query(ip, api_id, api_id)
+        result = result.merge(na_res) if (na_res.is_a?(Hash))
       }
       result
     else
